@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>位置シミュレータ</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+  :root { --bg:#f6f6f4; --panel:#fff; --fg:#1d1d1f; --muted:#6e6e73; --line:#e3e3e0; --accent:#2563eb; --danger:#c2410c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161617; --panel:#1f1f21; --fg:#f2f2f2; --muted:#9a9aa0; --line:#333336; --accent:#60a5fa; --danger:#fb923c; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 -apple-system, "Hiragino Sans", sans-serif; background:var(--bg); color:var(--fg); display:flex; height:100vh; }
+  aside { width:320px; flex:none; background:var(--panel); border-right:1px solid var(--line); padding:16px; overflow-y:auto; display:flex; flex-direction:column; gap:18px; }
+  #map { flex:1; }
+  h1 { font-size:16px; margin:0; }
+  h2 { font-size:12px; font-weight:600; color:var(--muted); margin:0 0 6px; text-transform:uppercase; letter-spacing:.04em; }
+  select, input[type=text], input[type=number] { width:100%; padding:7px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); font:inherit; }
+  button { padding:7px 10px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); font:inherit; cursor:pointer; white-space:nowrap; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { color:var(--danger); }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; gap:6px; align-items:center; }
+  .row > * { flex:1; }
+  .seg { display:flex; border:1px solid var(--line); border-radius:6px; overflow:hidden; }
+  .seg button { flex:1; border:0; border-radius:0; }
+  .seg button.on { background:var(--accent); color:#fff; }
+  .muted { color:var(--muted); font-size:12px; }
+  #status { font-size:12px; padding:8px; border-radius:6px; background:var(--bg); white-space:pre-wrap; }
+  #status.err { color:var(--danger); }
+  ul { list-style:none; margin:0; padding:0; }
+  li { display:flex; gap:6px; align-items:center; padding:3px 0; }
+  li span { flex:1; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  li button { padding:2px 6px; font-size:12px; }
+  label.chk { display:flex; gap:6px; align-items:center; }
+</style>
+</head>
+<body>
+<aside>
+  <h1>位置シミュレータ</h1>
+
+  <section>
+    <h2>端末</h2>
+    <div class="row"><select id="device"></select><button id="reload" style="flex:none">↻</button></div>
+  </section>
+
+  <section>
+    <h2>モード</h2>
+    <div class="seg"><button id="modePoint" class="on">地点</button><button id="modeRoute">ルート</button></div>
+    <p class="muted" id="modeHelp">地図をクリックすると、その場所に移動します。</p>
+  </section>
+
+  <section>
+    <h2>検索・座標</h2>
+    <div class="row"><input type="text" id="query" placeholder="地名 または 35.681,139.767"><button id="go" style="flex:none">移動</button></div>
+  </section>
+
+  <section id="routeBox" hidden>
+    <h2>ルート</h2>
+    <div class="row" style="margin-bottom:6px">
+      <input type="number" id="speed" value="4.8" step="0.5" min="0.5"><span class="muted" style="flex:none">km/h</span>
+    </div>
+    <div class="seg" style="margin-bottom:6px">
+      <button data-speed="4.8">徒歩</button><button data-speed="15">自転車</button><button data-speed="40">車</button>
+    </div>
+    <label class="chk" style="margin-bottom:6px"><input type="checkbox" id="loop">往復を繰り返す</label>
+    <div class="row" style="margin-bottom:6px">
+      <button id="play" class="primary">再生</button><button id="pause" disabled>一時停止</button><button id="stop" disabled>停止</button>
+    </div>
+    <div class="row">
+      <button id="undo">1点戻す</button><button id="clearRoute">消去</button>
+      <label style="flex:1"><button type="button" onclick="gpx.click()" style="width:100%">GPX読込</button></label>
+    </div>
+    <input type="file" id="gpx" accept=".gpx" hidden>
+    <p class="muted" id="routeInfo"></p>
+  </section>
+
+  <section>
+    <h2>お気に入り</h2>
+    <button id="fav" style="width:100%;margin-bottom:6px">現在地点を追加</button>
+    <ul id="favs"></ul>
+  </section>
+
+  <section>
+    <button id="reset" class="danger" style="width:100%">シミュレーション解除（実際のGPSに戻す）</button>
+  </section>
+
+  <div id="status">準備中…</div>
+</aside>
+<div id="map"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const store = {
+  get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+
+const map = L.map('map').setView(store.get('view', [35.681, 139.767]), store.get('zoom', 15));
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19, attribution: '&copy; OpenStreetMap contributors',
+}).addTo(map);
+map.on('moveend', () => { const c = map.getCenter(); store.set('view', [c.lat, c.lng]); store.set('zoom', map.getZoom()); });
+
+const marker = L.circleMarker([0, 0], { radius: 9, color: '#fff', weight: 3, fillColor: '#2563eb', fillOpacity: 1 });
+const routeLine = L.polyline([], { color: '#2563eb', weight: 4, opacity: .7 }).addTo(map);
+const routeDots = L.layerGroup().addTo(map);
+let mode = 'point', route = [], current = null, playing = false;
+
+function status(msg, err = false) { $('status').textContent = msg; $('status').className = err ? 'err' : ''; }
+
+async function api(path, body) {
+  const res = await fetch(path, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+const udid = () => $('device').value;
+
+async function loadDevices() {
+  status('端末を検索中…');
+  try {
+    const { devices } = await api('/api/devices');
+    $('device').innerHTML = devices.map(d => `<option value="${d.udid}">${d.name}</option>`).join('');
+    const last = store.get('device');
+    if (devices.some(d => d.udid === last)) $('device').value = last;
+    status(devices.length ? `${devices.length} 台の端末が見つかりました` : '端末が見つかりません。USBケーブルで接続し（初回は端末で「信頼」を許可）、数秒後に ↻ を押してください', !devices.length);
+  } catch (e) { status(e.message, true); }
+}
+$('device').onchange = () => store.set('device', udid());
+$('reload').onclick = loadDevices;
+
+function showPosition(lat, lng) {
+  current = [lat, lng];
+  marker.setLatLng(current).addTo(map);
+}
+
+async function setLocation(lat, lng, pan = false) {
+  if (!udid()) return status('端末が選択されていません', true);
+  try {
+    await api('/api/set', { udid: udid(), lat, lng });
+    showPosition(lat, lng);
+    if (pan) map.setView([lat, lng], Math.max(map.getZoom(), 15));
+    setPlaying(false);
+    status(`設定しました: ${lat.toFixed(6)}, ${lng.toFixed(6)}`);
+  } catch (e) { status(e.message, true); }
+}
+
+// --- モード切替 ---
+function setMode(m) {
+  mode = m;
+  $('modePoint').classList.toggle('on', m === 'point');
+  $('modeRoute').classList.toggle('on', m === 'route');
+  $('routeBox').hidden = m !== 'route';
+  $('modeHelp').textContent = m === 'point' ? '地図をクリックすると、その場所に移動します。' : '地図をクリックしてウェイポイントを追加します。';
+}
+$('modePoint').onclick = () => setMode('point');
+$('modeRoute').onclick = () => setMode('route');
+
+map.on('click', e => {
+  const { lat, lng } = e.latlng;
+  if (mode === 'point') setLocation(lat, lng);
+  else { route.push([lat, lng]); drawRoute(); }
+});
+
+// --- ルート ---
+function distanceKm(pts) {
+  let d = 0;
+  for (let i = 1; i < pts.length; i++) d += L.latLng(pts[i - 1]).distanceTo(pts[i]);
+  return d / 1000;
+}
+function drawRoute() {
+  routeLine.setLatLngs(route);
+  routeDots.clearLayers();
+  route.forEach((p, i) => L.circleMarker(p, { radius: i === 0 ? 6 : 4, color: '#2563eb', fillColor: i === 0 ? '#16a34a' : '#fff', fillOpacity: 1, weight: 2 }).addTo(routeDots));
+  const km = distanceKm(route), speed = parseFloat($('speed').value) || 4.8;
+  $('routeInfo').textContent = route.length ? `${route.length} 点 / ${km.toFixed(2)} km / 約 ${Math.round(km / speed * 60)} 分` : '';
+}
+$('undo').onclick = () => { route.pop(); drawRoute(); };
+$('clearRoute').onclick = () => { route = []; drawRoute(); };
+$('speed').oninput = drawRoute;
+document.querySelectorAll('[data-speed]').forEach(b => b.onclick = () => { $('speed').value = b.dataset.speed; drawRoute(); });
+
+$('gpx').onchange = async e => {
+  const file = e.target.files[0]; if (!file) return;
+  const doc = new DOMParser().parseFromString(await file.text(), 'application/xml');
+  const pts = [...doc.querySelectorAll('trkpt, rtept, wpt')].map(n => [parseFloat(n.getAttribute('lat')), parseFloat(n.getAttribute('lon'))]);
+  if (!pts.length) return status('GPX に座標が見つかりません', true);
+  route = pts; drawRoute(); map.fitBounds(routeLine.getBounds(), { padding: [40, 40] });
+  status(`GPX を読み込みました（${pts.length} 点）`);
+  e.target.value = '';
+};
+
+function setPlaying(p) {
+  playing = p;
+  $('play').disabled = p; $('pause').disabled = !p; $('stop').disabled = !p;
+}
+$('play').onclick = async () => {
+  if (route.length < 2) return status('ルートには 2 点以上必要です', true);
+  try {
+    await api('/api/route/start', { udid: udid(), points: route, speed: parseFloat($('speed').value), loop: $('loop').checked });
+    setPlaying(true);
+  } catch (e) { status(e.message, true); }
+};
+$('pause').onclick = async () => {
+  const { paused } = await api('/api/route/pause', {});
+  $('pause').textContent = paused ? '再開' : '一時停止';
+};
+$('stop').onclick = async () => { await api('/api/route/stop', {}); setPlaying(false); status('ルート再生を停止しました'); };
+
+// --- 検索 ---
+$('go').onclick = search;
+$('query').onkeydown = e => { if (e.key === 'Enter' && !e.isComposing) search(); };
+async function search() {
+  const q = $('query').value.trim(); if (!q) return;
+  const m = q.match(/^\s*(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)\s*$/);
+  if (m) return setLocation(parseFloat(m[1]), parseFloat(m[2]), true);
+  try {
+    const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`);
+    const [hit] = await res.json();
+    if (!hit) return status('見つかりませんでした', true);
+    const lat = parseFloat(hit.lat), lng = parseFloat(hit.lon);
+    if (mode === 'route') { map.setView([lat, lng], 16); status(hit.display_name); }
+    else setLocation(lat, lng, true);
+  } catch (e) { status('検索に失敗しました: ' + e.message, true); }
+}
+
+// --- お気に入り ---
+function renderFavs() {
+  const favs = store.get('favs', []);
+  $('favs').innerHTML = '';
+  favs.forEach((f, i) => {
+    const li = document.createElement('li');
+    const span = document.createElement('span');
+    span.textContent = f.name; span.title = `${f.lat}, ${f.lng}`;
+    span.onclick = () => mode === 'route' ? (route.push([f.lat, f.lng]), drawRoute()) : setLocation(f.lat, f.lng, true);
+    const del = document.createElement('button');
+    del.textContent = '×';
+    del.onclick = () => { favs.splice(i, 1); store.set('favs', favs); renderFavs(); };
+    li.append(span, del); $('favs').append(li);
+  });
+}
+$('fav').onclick = () => {
+  if (!current) return status('先に地点を設定してください', true);
+  const name = prompt('名前', `${current[0].toFixed(5)}, ${current[1].toFixed(5)}`);
+  if (!name) return;
+  const favs = store.get('favs', []);
+  favs.push({ name, lat: current[0], lng: current[1] });
+  store.set('favs', favs); renderFavs();
+};
+
+$('reset').onclick = async () => {
+  try {
+    await api('/api/clear', { udid: udid() });
+    marker.remove(); current = null; setPlaying(false);
+    status('シミュレーションを解除しました');
+  } catch (e) { status(e.message, true); }
+};
+
+// --- 再生中の位置を反映 ---
+setInterval(async () => {
+  try {
+    const s = await api('/api/status');
+    if (s.error) status(s.error, true);
+    if (s.position && (!current || s.position.lat !== current[0] || s.position.lng !== current[1])) showPosition(s.position.lat, s.position.lng);
+    if (s.route) status(`ルート再生中 ${s.route.index} / ${s.route.total}${s.route.paused ? '（一時停止）' : ''}`);
+    else if (playing) { setPlaying(false); if (!s.error) status('ルート再生が終了しました'); }
+  } catch {}
+}, 1000);
+
+renderFavs();
+loadDevices();
+</script>
+</body>
+</html>
